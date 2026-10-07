@@ -22,7 +22,7 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
-from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
+from agent.message_metadata import NON_WIRE_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
@@ -1221,11 +1221,12 @@ def build_api_messages(
         api_msg = _clone_message_for_send(msg)
         # api_content is bookkeeping (exact bytes sent), never a provider field — pop
         # it from EVERY outgoing copy. Persistence/display fields (display_*, _row_id,
-        # timestamp) are local bookkeeping: strict OpenAI backends reject unknown keys
-        # and only chat-completions strips underscore keys. The token estimator drops
-        # the same set, so it never prices bytes the provider never receives.
+        # timestamp) and private truncation-recovery markers are local bookkeeping:
+        # strict OpenAI backends reject unknown keys and only chat-completions strips
+        # underscore keys. The token estimator drops the same set, so it never prices
+        # bytes the provider never receives.
         _api_content = api_msg.pop("api_content", None)
-        for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        for key in NON_WIRE_MESSAGE_FIELDS:
             api_msg.pop(key, None)
 
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
@@ -1263,9 +1264,6 @@ def build_api_messages(
         # After the reasoning copy so thinking-only turns keep payload.
         fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(canonical_messages) - 1))
         # _thinking_prefill survives intentionally: the drop pass below needs it.
-        # Strip length-continuation marks; some transports keep underscore keys.
-        api_msg.pop("_length_continuation_fragment", None)
-        api_msg.pop("_length_continuation_nudge", None)
         # Strip Codex Responses fields (call_id, response_item_id): strict providers
         # reject unknown fields. New dicts keep the internal list intact for Codex.
         if agent._should_sanitize_tool_calls():

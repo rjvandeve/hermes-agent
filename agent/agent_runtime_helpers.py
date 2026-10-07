@@ -591,6 +591,10 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # A /steer row that ended the previous run is already persisted; merging the next
             # prompt into it would rewrite it in place and re-break replay parity.
             and prev.get("display_kind") != STEER_DISPLAY_KIND
+            # A truncation-recovery nudge stays its own row: folding it in place rewrites the
+            # user's durable request, drops the private tag the retry de-dupe and exit cleanup
+            # key on, and stacks one copy per retry. The per-call copy merge keeps alternation.
+            and not (prev.get("_length_continuation_nudge") or msg.get("_length_continuation_nudge"))
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
         ):

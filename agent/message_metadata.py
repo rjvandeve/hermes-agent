@@ -13,6 +13,15 @@ from typing import Any, MutableMapping, Optional, TypeVar
 # display_metadata is ~9KB and would trigger premature compaction).
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset({"timestamp", "display_kind", "display_metadata", "_row_id"})
 
+# Hermes-private truncation-recovery markers. History keeps them (retry de-dupe,
+# compressor / crash-persisted synthetic-turn checks); no provider copy or estimate does.
+PRIVATE_RECOVERY_MESSAGE_FIELDS = frozenset({
+    "_length_continuation_fragment", "_length_continuation_nudge", "_tool_call_truncation_nudge",
+})
+
+# The one set the request builder strips from every outgoing copy and the estimator skips.
+NON_WIRE_MESSAGE_FIELDS = PERSISTENCE_ONLY_MESSAGE_FIELDS | PRIVATE_RECOVERY_MESSAGE_FIELDS
+
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
 
 
