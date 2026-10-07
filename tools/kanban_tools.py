@@ -222,6 +222,73 @@ def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Op
     return {**(metadata or {}), "worker_session_id": session_id} if session_id else metadata
 
 
+def bind_attempt_session_from_env(
+    session_id: Optional[str] = None,
+    *,
+    force: bool = False,
+) -> dict:
+    """Early-bind the real worker session to the exact board/task/run (R5).
+
+    Called once session identity exists (agent init), not only on complete.
+    Never fabricates a session or zero cost. Refuses stale run ownership and
+    cross-profile misattribution. Returns a small status dict for tests.
+    """
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return {"ok": False, "reason": "not_kanban_worker"}
+    if _is_delegated_child_context():
+        return {"ok": False, "reason": "delegated_child"}
+    sid = (session_id or os.environ.get("HERMES_SESSION_ID") or "").strip()
+    if not sid:
+        # Honest: failure before a session exists — do not invent one.
+        return {"ok": False, "reason": "no_session_yet"}
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    try:
+        run_id = int(run_raw) if run_raw else None
+    except ValueError:
+        return {"ok": False, "reason": "bad_run_id"}
+    if run_id is None:
+        return {"ok": False, "reason": "no_run_id"}
+    profile = (
+        os.environ.get("HERMES_PROFILE")
+        or os.environ.get("HERMES_KANBAN_PROFILE")
+        or None
+    )
+    board = os.environ.get("HERMES_KANBAN_BOARD") or None
+    patch = {
+        "worker_session_id": sid,
+        "worker_session_bound_at": int(time.time()),
+    }
+    if profile:
+        patch["worker_profile"] = profile
+    if board:
+        patch["worker_board"] = board
+    try:
+        with _board(board, quiet_close=True) as (kb, conn):
+            ok = kb.merge_running_run_metadata(
+                conn, tid, run_id, patch, expected_profile=profile,
+            )
+            if not ok:
+                return {
+                    "ok": False,
+                    "reason": "stale_or_foreign_run",
+                    "task_id": tid,
+                    "run_id": run_id,
+                    "session_id": sid,
+                }
+            return {
+                "ok": True,
+                "task_id": tid,
+                "run_id": run_id,
+                "session_id": sid,
+                "profile": profile,
+                "board": board,
+            }
+    except Exception as exc:
+        logger.debug("bind_attempt_session_from_env failed: %s", exc, exc_info=True)
+        return {"ok": False, "reason": f"error:{type(exc).__name__}"}
+
+
 def _enforce_worker_task_ownership(tid: str) -> None:
     """A dispatcher-spawned worker may only mutate its own HERMES_KANBAN_TASK; a
     prompt-injected ``task_id`` must not corrupt sibling/cross-tenant runs.

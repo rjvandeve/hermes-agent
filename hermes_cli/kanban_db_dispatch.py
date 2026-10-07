@@ -397,13 +397,35 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    boot witness was added) compares the start time only.
+
+    Composite fingerprints (``epoch|start``) require exact epoch equality and drift-tolerant start
+    comparison via ``gateway.status.start_time_fingerprints_match`` (#117505 macOS ~1s boottime drift).
+    Exact string equality false-deads live workers under ±100 centisecond drift. Unavailable /
+    malformed evidence stays fail-closed (recycled=True).
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        current = _process_fingerprint(int(pid))
+        if current is None:
+            return True  # unreadable evidence → refuse to treat as our worker
+        try:
+            rec_epoch, rec_start = started_at.split("|", 1)
+            cur_epoch, cur_start = current.split("|", 1)
+        except ValueError:
+            return True
+        if rec_epoch != cur_epoch:
+            return True  # foreign boot / instantiation
+        if rec_start == "" or cur_start == "":
+            return True  # malformed start component
+        try:
+            from gateway.status import start_time_fingerprints_match
+            return not start_time_fingerprints_match(rec_start, cur_start)
+        except (TypeError, ValueError):
+            return True
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
