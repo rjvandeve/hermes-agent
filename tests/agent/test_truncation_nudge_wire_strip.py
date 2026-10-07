@@ -114,12 +114,12 @@ def _resp(finish_reason, tool_args):
                            model="test/model", usage=None)
 
 
-def test_retry_ladder_transport_input_never_carries_marker(agent):
-    """Real run_conversation phase dispatch: 4 bounded retries then refusal.
+def _run_ladder(agent, responses):
+    """Real run_conversation phase dispatch with the given provider responses.
 
     Captures the api_messages every transport receives (``_build_api_kwargs`` input,
-    before chat-completions' own underscore sweep) on each attempt, plus the request's
-    ``max_tokens`` that ``truncated_tool_call_retries`` boosts via apply_retry_restarts.
+    before chat-completions' own underscore sweep), the internal history at that moment,
+    and the request ``max_tokens`` that ``truncated_tool_call_retries`` boosts.
     """
     seen, budgets, history = [], [], []
     real_build = agent._build_api_kwargs
@@ -133,34 +133,59 @@ def test_retry_ladder_transport_input_never_carries_marker(agent):
         budgets.append(kwargs.get("max_tokens"))
         return kwargs
 
-    truncated = [_resp("length", '{"path":"r.md","content":"partial') for _ in range(5)]
     with (
-        patch("model_tools.handle_function_call") as hfc,
+        patch("model_tools.handle_function_call", return_value='{"success": true}') as hfc,
         patch.object(agent, "_build_api_kwargs", side_effect=spy),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        agent.client.chat.completions.create.side_effect = truncated
+        agent.client.chat.completions.create.side_effect = responses
         result = agent.run_conversation("write the report")
-
-    hfc.assert_not_called()  # incomplete args never execute
-    assert result.get("partial") is True
-    assert len(seen) == 5, f"bounded: 1 + 4 retries, got {len(seen)}"
+    assert len(seen) == len(responses), f"bounded: 1 + 4 retries, got {len(seen)}"
+    assert result.get("partial") is True  # refused after the cap
     for n, api_messages in enumerate(seen):
         assert _leaked(api_messages) == [], f"attempt {n + 1} leaked {_leaked(api_messages)}"
-    # History: the user's request is never rewritten; one tagged nudge row, replaced per retry.
+    return seen, budgets, history, hfc
+
+
+def _truncated():
+    return _resp("length", '{"path":"r.md","content":"partial')
+
+
+def _assert_budget_ladder(budgets):
+    # Retry counter drives the output budget: unset on the first truncation, rising after.
+    assert budgets[0] is None
+    assert all(a < b for a, b in zip(budgets[1:], budgets[2:])), budgets
+
+
+def test_ladder_after_tool_step_nudge_row_reaches_wire_without_marker(agent):
+    """Multi-step shape: the nudge follows a tool result, so it is its own wire row."""
+    seen, budgets, history, hfc = _run_ladder(
+        agent, [_resp("tool_calls", '{"path":"a.md","content":"ok"}')] + [_truncated() for _ in range(5)],
+    )
+    hfc.assert_called_once()  # only the complete call ran; truncated args never execute
+    _assert_budget_ladder(budgets[1:])
+    prefix = seen[1]  # [system, request, assistant tool_call, tool result]: first truncation
+    assert [m["role"] for m in prefix] == ["system", "user", "assistant", "tool"]
+    for api_messages in seen[2:]:
+        # Prior rows byte-identical (cache prefix); one guidance row, replaced not stacked.
+        assert json.dumps(api_messages[: len(prefix)], sort_keys=True) == json.dumps(prefix, sort_keys=True)
+        assert api_messages[len(prefix):] == [{"role": "user", "content": _TOOL_CALL_TRUNCATION_CHUNK_NUDGE}]
+    for rows in history[2:]:  # history keeps the private tag on exactly one row
+        assert [r for r in rows if r[2]] == [("user", _TOOL_CALL_TRUNCATION_CHUNK_NUDGE, True)]
+
+
+def test_ladder_on_request_never_rewrites_user_row_or_stacks(agent):
+    """Nudge directly after the user's request: history must keep two rows (the per-call
+    copy merges them for alternation); folding in place rewrote the request and stacked."""
+    seen, budgets, history, hfc = _run_ladder(agent, [_truncated() for _ in range(5)])
+    hfc.assert_not_called()
+    _assert_budget_ladder(budgets)
     task = ("user", "write the report", False)
     nudge = ("user", _TOOL_CALL_TRUNCATION_CHUNK_NUDGE, True)
     assert history[1:] == [[task, nudge]] * 4
-    # Wire: one guidance copy per retry (the per-call merge), never stacked; system and the
-    # original request bytes stay a stable prefix for the prompt cache.
     system, request = seen[0]
     assert request == {"role": "user", "content": "write the report"}
     for api_messages in seen[1:]:
-        assert api_messages == seen[1]
-        assert api_messages[0] == system
-        assert api_messages[1]["content"] == request["content"] + "\n\n" + _TOOL_CALL_TRUNCATION_CHUNK_NUDGE
-    # Retry counter drives the output-budget ladder: unset on attempt 1, strictly rising after.
-    assert budgets[0] is None
-    assert all(a < b for a, b in zip(budgets[1:], budgets[2:])), budgets
+        assert api_messages == [system, {"role": "user", "content": "write the report\n\n" + _TOOL_CALL_TRUNCATION_CHUNK_NUDGE}]
