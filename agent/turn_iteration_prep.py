@@ -421,6 +421,7 @@ def apply_retry_restarts(
     final_response: Any, retry_count: Any, max_retries: Any, api_call_count: Any,
     restart_count: Any, length_continue_retries: Any,
     _preflight_compression_blocked: Any, _turn_exit_reason: Any,
+    truncated_tool_call_retries: Any = 0,
 ) -> RetryRestartVerdict:
     """Consume the ``TurnRetryState`` restart flags after the retry loop, in the original
     priority order. Refunds the iteration budget/count for restarts that produced no valid
@@ -531,8 +532,12 @@ def apply_retry_restarts(
 
     if _retry.restart_with_length_continuation:
         # Boost the output budget per retry (shared ladder, see boosted_output_cap).
+        # Text path increments length_continue_retries; truncated-tool path increments
+        # truncated_tool_call_retries. Both arm this same restart flag so the outer
+        # loop reassembles api_messages — use the higher ladder step.
+        n = max(int(length_continue_retries or 0), int(truncated_tool_call_retries or 0))
         agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), length_continue_retries
+            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
         )
         return _verdict("continue")
 

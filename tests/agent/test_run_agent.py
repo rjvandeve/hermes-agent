@@ -4364,6 +4364,79 @@ class TestRunConversation:
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
 
+    def test_truncated_tool_call_second_api_call_carries_chunk_guidance(self, agent):
+        """INTEGRATION GATE: 2nd create kwargs must include chunk/checkpoint guidance.
+
+        Injecting into ``messages`` then ``continue``-ing the inner API loop rebuilds
+        from stale ``api_messages`` (boost-only same-input — the audited defect). The
+        tool path must mirror text truncation: break + restart_with_length_continuation
+        so outer assemble_api_request rebinds messages with the nudge onto the wire.
+        """
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc],
+        )
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="stop", tool_calls=[good_tc],
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+
+        with (
+            patch("model_tools.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.client.chat.completions.create.side_effect = [
+                truncated_resp, good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        calls = agent.client.chat.completions.create.call_args_list
+        assert len(calls) >= 2, f"expected ≥2 API calls, got {len(calls)}"
+
+        def _has_guidance(messages) -> bool:
+            markers = (
+                "do not retry the same oversized",
+                "break the remaining work into smaller",
+                "break the content into multiple smaller",
+            )
+            for m in messages or []:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("_tool_call_truncation_nudge") or m.get("_length_continuation_nudge"):
+                    return True
+                content = m.get("content") or ""
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(p.get("text", p) if isinstance(p, dict) else p) for p in content
+                    )
+                text = str(content).lower()
+                if any(mk in text for mk in markers):
+                    return True
+            return False
+
+        first_msgs = calls[0].kwargs.get("messages") or []
+        second_msgs = calls[1].kwargs.get("messages") or []
+        assert not _has_guidance(first_msgs), "1st call is the original task only"
+        assert _has_guidance(second_msgs), (
+            "2nd API call must carry chunk/checkpoint guidance in messages — "
+            f"got: {[(m.get('role'), str(m.get('content') or '')[:100]) for m in second_msgs if isinstance(m, dict)]}"
+        )
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+
     def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
         """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must
         retry up to 3 times rather than hard-failing after one — and recover

@@ -1175,6 +1175,14 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
 
+    # R5: bind the real attempt session to task_runs.metadata early enough that
+    # crashed/gave_up runs still carry worker_session_id for R2 cost linkage.
+    # Best-effort; never raise into agent init. No-op outside kanban workers.
+    with suppress(Exception):
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            from tools.kanban_tools import bind_attempt_session_from_env
+            bind_attempt_session_from_env(agent.session_id)
+
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)

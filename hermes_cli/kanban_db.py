@@ -1962,28 +1962,119 @@ def _end_run(
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
     is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
-    to end a worker that survived its own terminal transition."""
+    to end a worker that survived its own terminal transition.
+
+    When ``metadata`` is provided it is **merged** over any already-bound run
+    metadata (R5 attempt-session writer): early ``worker_session_id`` must
+    survive crash/timeout/gave_up payloads that only carry exit facts. A
+    ``None`` metadata argument leaves prior metadata untouched.
+    """
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_expires = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
-    )
+    if metadata is not None:
+        prior_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        prior: dict = {}
+        if prior_row and prior_row["metadata"]:
+            try:
+                loaded = json.loads(prior_row["metadata"])
+                if isinstance(loaded, dict):
+                    prior = loaded
+            except Exception:
+                prior = {}
+        merged = {**prior, **metadata}
+        meta_json = _json_or_null(merged)
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (status or outcome, outcome, summary, error, meta_json, now, run_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   ended_at      = ?,
+                   claim_expires = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (status or outcome, outcome, summary, error, now, run_id),
+        )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
+
+
+def merge_running_run_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    patch: dict,
+    *,
+    expected_profile: Optional[str] = None,
+) -> bool:
+    """Additive merge into an in-flight task_runs.metadata row.
+
+    Refuses when the run is not the task's current run, the task is not
+    ``running``, the run has already ended, or ``expected_profile`` disagrees
+    with the run's profile. Never fabricates keys; empty patch is a no-op True
+    when ownership checks pass. Returns False on stale/foreign refusal.
+    """
+    if not isinstance(patch, dict):
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            """
+            SELECT t.status AS task_status, t.current_run_id, t.assignee,
+                   r.id AS run_id, r.profile AS run_profile, r.ended_at, r.metadata
+              FROM tasks t
+              JOIN task_runs r ON r.id = ?
+             WHERE t.id = ?
+            """,
+            (int(run_id), task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["task_status"] != "running":
+            return False
+        if row["current_run_id"] is None or int(row["current_run_id"]) != int(run_id):
+            return False
+        if row["ended_at"] is not None:
+            return False
+        if expected_profile is not None:
+            run_prof = row["run_profile"] or row["assignee"]
+            if run_prof and str(run_prof) != str(expected_profile):
+                return False
+        prior: dict = {}
+        if row["metadata"]:
+            try:
+                loaded = json.loads(row["metadata"])
+                if isinstance(loaded, dict):
+                    prior = loaded
+            except Exception:
+                prior = {}
+        merged = {**prior, **patch}
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND ended_at IS NULL",
+            (json.dumps(merged, ensure_ascii=False), int(run_id)),
+        )
+        return True
 
 
 def _first_line(text: Optional[str], limit: int) -> str:

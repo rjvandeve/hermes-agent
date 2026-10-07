@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -2584,9 +2585,11 @@ def test_codex_truncated_tool_call_is_retried_with_boosted_output_budget(monkeyp
     agent.max_tokens = 1000
     responses = [_codex_truncated_tool_call_response(), _codex_message_response("Done.")]
     seen_caps: list = []
+    seen_wire: list = []
 
     def _fake_call(api_kwargs):
         seen_caps.append(api_kwargs.get("max_output_tokens"))
+        seen_wire.append(json.dumps(api_kwargs, default=str))
         return responses.pop(0)
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_call)
@@ -2596,8 +2599,13 @@ def test_codex_truncated_tool_call_is_retried_with_boosted_output_budget(monkeyp
     assert result["completed"] is True
     assert result["final_response"] == "Done."
     assert seen_caps == [1000, 2000]
-    # The retry re-issues the same call: no interim assistant row, no continuation nudge.
-    assert [m["role"] for m in result["messages"] if m["role"] != "system"] == ["user", "assistant"]
+    # No interim assistant row; chunk guidance rides as its own row and the user's request
+    # is never rewritten. Its private recovery tags never reach the Responses wire.
+    from agent.turn_truncation import _TOOL_CALL_TRUNCATION_CHUNK_NUDGE
+    rows = [(m["role"], m.get("content")) for m in result["messages"] if m["role"] != "system"]
+    assert rows == [("user", "run it"), ("user", _TOOL_CALL_TRUNCATION_CHUNK_NUDGE), ("assistant", "Done.")]
+    assert "Do NOT retry the same oversized" in seen_wire[1]
+    assert not any("_tool_call_truncation_nudge" in w or "_length_continuation" in w for w in seen_wire)
 
 
 def test_codex_text_only_max_output_incomplete_keeps_codex_continuation(monkeypatch):
