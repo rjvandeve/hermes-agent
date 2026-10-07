@@ -4,9 +4,11 @@ never execute incomplete arguments, and still refuse after the bounded retry cap
 Replays the recorded production path:
   Truncated tool call detected — retrying API call (N/4)...
   Truncated tool call response detected again — refusing to execute incomplete tool arguments
+
+Wire-path integration gate lives in test_run_agent.TestRunConversation
+(test_truncated_tool_call_second_api_call_carries_chunk_guidance).
 """
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -102,11 +104,17 @@ def test_inject_replaces_tail_nudge_instead_of_stacking():
     assert messages[0]["content"] == "task"
 
 
-def test_retry_injects_guidance_and_boosts_without_appending_tool_calls():
+def test_retry_injects_guidance_and_breaks_for_outer_reassemble():
+    """Must break + arm restart_with_length_continuation (mirror text path).
+
+    continue would re-enter build_api_request on stale api_messages (boost-only).
+    """
     agent = _agent()
     st = _st(agent)
-    verdict = _retry_truncated_tool_call(st, {})
-    assert verdict.action == "continue"
+    retry = TurnRetryState()
+    verdict = _retry_truncated_tool_call(st, retry, {})
+    assert verdict.action == "break"
+    assert retry.restart_with_length_continuation is True
     assert st.truncated_tool_call_retries == 1
     assert agent._ephemeral_max_output_tokens and agent._ephemeral_max_output_tokens > 4096
     # No assistant/tool_calls row — incomplete args never enter the transcript
@@ -120,11 +128,15 @@ def test_four_retries_then_refuse_still_does_not_execute():
     agent = _agent()
     st = _st(agent)
     for i in range(4):
-        v = _retry_truncated_tool_call(st, {})
-        assert v.action == "continue", f"attempt {i+1}"
+        retry = TurnRetryState()
+        v = _retry_truncated_tool_call(st, retry, {})
+        assert v.action == "break", f"attempt {i+1}"
+        assert retry.restart_with_length_continuation is True
     # 5th path = refuse
-    v = _retry_truncated_tool_call(st, {})
+    retry = TurnRetryState()
+    v = _retry_truncated_tool_call(st, retry, {})
     assert v.action == "return"
+    assert retry.restart_with_length_continuation is False
     assert v.result["partial"] is True
     assert v.result["failure_reason"] == "truncated"
     # Still no tool_calls in messages
@@ -138,12 +150,13 @@ def test_stub_retry_uses_dropped_tools_continuation_copy():
     agent = _agent()
     resp = SimpleNamespace(id=PARTIAL_STREAM_STUB_ID, _dropped_tool_names=["write_file"])
     st = _st(agent, is_stub=True, response=resp)
-    # is_stub property on real _Trunc uses response.id; emulate via flag already set
-    _retry_truncated_tool_call(st, {})
+    retry = TurnRetryState()
+    _retry_truncated_tool_call(st, retry, {})
     text = st.messages[-1]["content"].lower()
     assert "write_file" in text
     assert "smaller" in text
     assert "available" in text
+    assert retry.restart_with_length_continuation is True
 
 
 def _mock_msg(*, content="", tool_calls=None):
@@ -151,7 +164,7 @@ def _mock_msg(*, content="", tool_calls=None):
     return m
 
 
-def test_recover_from_truncation_tool_path_injects_guidance(monkeypatch):
+def test_recover_from_truncation_tool_path_breaks_with_guidance(monkeypatch):
     """End-to-end through recover_from_truncation (the production wrapper entry)."""
     agent = _agent()
     agent._get_transport = lambda: SimpleNamespace(
@@ -168,17 +181,18 @@ def test_recover_from_truncation_tool_path_injects_guidance(monkeypatch):
         tool_calls=[SimpleNamespace()],
         choices=[SimpleNamespace(message=_mock_msg(tool_calls=[SimpleNamespace()]))],
     )
-    # normalize_response_for_agent uses transport — already patched via _get_transport
 
     messages = [{"role": "user", "content": "write big file"}]
+    retry = TurnRetryState()
     verdict = recover_from_truncation(
-        agent, bad, "length", TurnRetryState(),
+        agent, bad, "length", retry,
         messages=messages, conversation_history=[], api_kwargs={},
         api_call_count=1, effective_task_id="t1", current_turn_user_idx=0,
         length_continue_retries=0, truncated_response_parts=[],
         truncated_tool_call_retries=0, retry_count=0, compression_attempts=0,
     )
-    assert verdict.action == "continue"
+    assert verdict.action == "break"
+    assert retry.restart_with_length_continuation is True
     assert any(m.get(_TOOL_CALL_TRUNCATION_NUDGE_FLAG) for m in verdict.messages)
     assert verdict.truncated_tool_call_retries == 1
 

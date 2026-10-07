@@ -465,11 +465,20 @@ def inject_tool_call_truncation_guidance(
     return content
 
 
-def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict:
-    """Truncated tool call: retry up to 4× with a boosted max_tokens AND chunk/checkpoint
-    guidance that changes the failing preconditions — never re-issue the identical
-    oversized request forever. Incomplete tool arguments are never appended or executed;
-    after the cap, refuse (safety guard stands)."""
+def _retry_truncated_tool_call(
+    st: _Trunc, _retry: TurnRetryState, api_kwargs: Any,
+) -> TruncationVerdict:
+    """Truncated tool call: retry up to 4× with chunk/checkpoint guidance that changes
+    the failing preconditions — never re-issue the identical oversized request forever.
+
+    Mirrors ``_continue_text``: inject guidance into ``messages``, arm
+    ``restart_with_length_continuation``, and ``break`` out of the inner API loop so the
+    outer iteration re-runs ``assemble_api_request`` from the updated transcript. Returning
+    ``continue`` would rebuild kwargs from stale ``api_messages`` (boost-only same-input
+    retry — the audited defect). Incomplete tool arguments are never appended or executed;
+    after the cap, refuse (safety guard stands). Output-budget boost is applied by
+    ``apply_retry_restarts`` using ``truncated_tool_call_retries``.
+    """
     agent = st.agent
     if st.truncated_tool_call_retries < 4:
         st.truncated_tool_call_retries += 1
@@ -483,10 +492,14 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             st.messages, is_stub=st.is_stub, dropped_tools=dropped,
         )
         agent._session_messages = st.messages
+        # Boost here so unit tests / mid-path readers see the ladder immediately; the
+        # outer apply_retry_restarts re-applies with the same n (does not clobber lower).
         agent._ephemeral_max_output_tokens = boosted_output_cap(
             agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
         )
-        return st.done("continue")  # don't append the broken response
+        # Exit inner API loop → outer iter reassembles api_messages from messages+nudge.
+        _retry.restart_with_length_continuation = True
+        return st.done("break")  # don't append the broken response; don't continue same kwargs
     agent._flush_status_buffer()
     if st.is_stub:
         agent._vprint(
@@ -585,7 +598,7 @@ def recover_from_truncation(
         if _trunc_msg is not None:
             if not _trunc_has_tool_calls:
                 return _continue_text(st, _retry, _trunc_msg)
-            return _retry_truncated_tool_call(st, api_kwargs)
+            return _retry_truncated_tool_call(st, _retry, api_kwargs)
 
     if len(messages) > 1:
         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn", diagnostic=True)

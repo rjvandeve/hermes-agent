@@ -20,6 +20,7 @@ def _agent(max_tokens, requested_cap, **extra):
 
 
 def _tool_call_budgets(agent, attempts=4):
+    """Tool path: break + restart flag, then apply_retry_restarts sets boost ladder."""
     st = SimpleNamespace(
         agent=agent, truncated_tool_call_retries=0, is_stub=False,
         messages=[{"role": "user", "content": "hi"}],
@@ -28,7 +29,18 @@ def _tool_call_budgets(agent, attempts=4):
     st.done = lambda action, result=None: action
     budgets = []
     for _ in range(attempts):
-        assert _retry_truncated_tool_call(st, {}) == "continue"
+        _retry = TurnRetryState()
+        assert _retry_truncated_tool_call(st, _retry, {}) == "break"
+        assert _retry.restart_with_length_continuation is True
+        verdict = apply_retry_restarts(
+            agent, _retry=_retry, response=None, interrupted=False, messages=[],
+            conversation_history=[], user_message="hi", api_kwargs={}, current_turn_user_idx=0,
+            final_response=None, retry_count=0, max_retries=3, api_call_count=1,
+            restart_count=0, length_continue_retries=0,
+            truncated_tool_call_retries=st.truncated_tool_call_retries,
+            _preflight_compression_blocked=False, _turn_exit_reason="unknown",
+        )
+        assert verdict.action == "continue"
         budgets.append(agent._ephemeral_max_output_tokens)
     return budgets
 
@@ -43,6 +55,7 @@ def _length_continuation_budgets(agent, attempts=4):
             conversation_history=[], user_message="hi", api_kwargs={}, current_turn_user_idx=0,
             final_response=None, retry_count=0, max_retries=3, api_call_count=1,
             restart_count=0, length_continue_retries=n,
+            truncated_tool_call_retries=0,
             _preflight_compression_blocked=False, _turn_exit_reason="unknown",
         )
         assert verdict.action == "continue"
