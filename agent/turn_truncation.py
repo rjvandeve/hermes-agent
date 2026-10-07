@@ -392,10 +392,84 @@ def boosted_output_cap(agent: Any, requested_cap: Optional[int], n: int, base: O
     return min(boost, limit) if limit else boost
 
 
+# Marker so retries replace rather than stack identical user rows, and compressor /
+# crash-persisted sessions can still recognize the synthetic turn.
+_TOOL_CALL_TRUNCATION_NUDGE_FLAG = "_tool_call_truncation_nudge"
+
+# Output-cap path: incomplete tool args were refused; next attempt must change shape.
+_TOOL_CALL_TRUNCATION_CHUNK_NUDGE = (
+    "[System: Your previous tool call was cut off before its arguments were complete "
+    "(output length limit). Hermes refused to execute incomplete arguments — that guard "
+    "stands. Do NOT retry the same oversized tool call. Break the remaining work into "
+    "smaller sequential tool calls (roughly ≤150 lines / ≤8K tokens of arguments each). "
+    "Prefer multiple patch/write_file calls over one giant payload. Checkpoint progress "
+    "on disk between steps and continue from where you left off.]"
+)
+
+# Stream-stall path (mirrors conversation_loop._get_continuation_prompt dropped-tools
+# wording so we do not import conversation_loop from this module — that import pulls
+# process bootstrap / real-home I/O unsuitable for unit tests).
+_TOOL_CALL_TRUNCATION_STUB_PREFIX = "[System: Your previous tool call "
+
+
+def tool_call_truncation_guidance(
+    *, is_stub: bool = False, dropped_tools: Optional[List[str]] = None,
+) -> str:
+    """User-turn guidance that changes preconditions after a truncated tool call.
+
+    When the stream named the cut tools, name them and demand smaller calls; otherwise
+    the chunk/checkpoint nudge. Never implies incomplete args may run.
+    """
+    if is_stub:
+        names = [str(n) for n in (dropped_tools or ["tool call"]) if n][:3] or ["tool call"]
+        tool_list = ", ".join(names)
+        return (
+            f"{_TOOL_CALL_TRUNCATION_STUB_PREFIX}({tool_list}) was too large and "
+            "the stream timed out before it could be delivered. Do NOT retry the same tool call "
+            "with the same large content. Instead, break the content into multiple smaller tool "
+            "calls (e.g. use multiple patch calls or write smaller files). Each tool call's "
+            "arguments must be under ~8K tokens to avoid stream timeouts. The cut was a transport "
+            "interruption, not a capability change — your tools remain fully available.]"
+        )
+    return _TOOL_CALL_TRUNCATION_CHUNK_NUDGE
+
+
+def inject_tool_call_truncation_guidance(
+    messages: List[Dict[str, Any]],
+    *,
+    is_stub: bool = False,
+    dropped_tools: Optional[List[str]] = None,
+) -> str:
+    """Ensure ``messages`` carries chunk/checkpoint guidance for the next API attempt.
+
+    Never appends incomplete tool_calls. Replaces a prior truncation/continuation
+    nudge at the tail so four retries do not stack four identical user rows.
+    Returns the guidance text that is now authoritative on the tail.
+    """
+    content = tool_call_truncation_guidance(is_stub=is_stub, dropped_tools=dropped_tools)
+    tail = messages[-1] if messages else None
+    if isinstance(tail, dict) and tail.get("role") == "user" and (
+        tail.get(_TOOL_CALL_TRUNCATION_NUDGE_FLAG) or tail.get("_length_continuation_nudge")
+    ):
+        tail["content"] = content
+        tail[_TOOL_CALL_TRUNCATION_NUDGE_FLAG] = True
+        tail["_length_continuation_nudge"] = True
+        return content
+    append_message(messages, {
+        "role": "user",
+        "content": content,
+        _TOOL_CALL_TRUNCATION_NUDGE_FLAG: True,
+        # Recognized by compressor / crash-persisted synthetic-turn checks.
+        "_length_continuation_nudge": True,
+    })
+    return content
+
+
 def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict:
-    """Truncated tool call: re-run the same call (up to 4×) with a boosted max_tokens —
-    a real output-cap truncation needs it, harmless for a network stall — else refuse to
-    execute incomplete arguments."""
+    """Truncated tool call: retry up to 4× with a boosted max_tokens AND chunk/checkpoint
+    guidance that changes the failing preconditions — never re-issue the identical
+    oversized request forever. Incomplete tool arguments are never appended or executed;
+    after the cap, refuse (safety guard stands)."""
     agent = st.agent
     if st.truncated_tool_call_retries < 4:
         st.truncated_tool_call_retries += 1
@@ -404,6 +478,11 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
+        dropped = getattr(st.response, "_dropped_tool_names", None)
+        inject_tool_call_truncation_guidance(
+            st.messages, is_stub=st.is_stub, dropped_tools=dropped,
+        )
+        agent._session_messages = st.messages
         agent._ephemeral_max_output_tokens = boosted_output_cap(
             agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
         )
